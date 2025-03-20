@@ -1,4 +1,5 @@
 <?php
+
 namespace App\Console\Commands;
 
 use Cache;
@@ -16,64 +17,71 @@ use App\Http\Controllers\WeekendControlController;
 class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
 {
     // ---------------------------------------------------------
-    // Sabit Tanımlamalar (Magic Numbers ve Zaman Aralıkları)
+    // Sabit Tanımlamalar
     // ---------------------------------------------------------
-    const ACTIVE_THRESHOLD_SECONDS = 40;               // Kullanıcının aktif sayılması için geo log zaman farkı (saniye)
-    const RESUME_CACHE_SECONDS = 360;                    // Resume push bildiriminin tekrar gönderilmemesi süresi: 6 dakika (360 saniye)
+    const ACTIVE_THRESHOLD_SECONDS = 40;
+    const RESUME_CACHE_SECONDS = 360; // 6 dakika
     const EARLY_CHECKIN_START = '06:00:00';
     const EARLY_CHECKIN_END = '08:00:00';
     const MORNING_CHECKIN_START = '08:00:00';
     const MORNING_CHECKIN_END = '09:00:00';
-    const STOP_CHECK_TIME = '18:05:00';                  // Stop kontrolü için beklenen zaman
-    const WORKMANAGER_ACTIVE_THRESHOLD_SECONDS = 60;     // Workmanager'ın aktif kabulü için eşik (saniye)
+    const STOP_CHECK_TIME = '18:05:00';
+    const WORKMANAGER_ACTIVE_THRESHOLD_SECONDS = 60;
+    const MAX_RESUME_ATTEMPTS = 3;
+    const NO_GEO_LOG_THRESHOLD_MINUTES = 20;
+    const RESUME_WAIT_HOURS = 2;
+    const WORKMANAGER_CONTROL_TOLERANCE_MINUTES = 3;
 
-    // Yeni sabitler
-    const MAX_RESUME_ATTEMPTS = 3;                       // Resume bildirimi için maksimum deneme sayısı
-    const NO_GEO_LOG_THRESHOLD_MINUTES = 20;             // GEO_LOGS kaydı yoksa veya 20 dk üzeriyse workmanager kapalı kabul
-    const RESUME_WAIT_HOURS = 2;                         // Maksimum denemeden sonra bekleme süresi (saat)
-    const WORKMANAGER_CONTROL_TOLERANCE_MINUTES = 3;     // 20 dk kontrolünde tolerans (dakika)
-    // Zaman dilimi ayarı
-    const TIMEZONE = 'Europe/Istanbul';
     // ---------------------------------------------------------
     // Komut Ayarları
     // ---------------------------------------------------------
     protected $signature = 'workmanager:updatelogs {--mode= : İşlem modu (varsayılan: normal, D: resume kontrol özet bildirimi)}';
     protected $description = 'Workmanager AI job: Kullanıcıların konum, izin/rapor durumlarına ve mesai bilgilerine göre workmanager_logs tablosunu günceller.';
+
+    // ---------------------------------------------------------
+    // Zaman Dilimi (Tüm Carbon işlemlerinde kullanılacak)
+    // ---------------------------------------------------------
+    protected $timezone = 'Europe/Istanbul';
+
     // ---------------------------------------------------------
     // handle() - Komutun Ana Giriş Noktası
     // ---------------------------------------------------------
     public function handle()
     {
-        $now = Carbon::now(self::TIMEZONE);
-        $today = Carbon::today(self::TIMEZONE)->format('Y-m-d');
+        $now = Carbon::now($this->timezone); // Zaman dilimini belirtiyoruz
+        $today = $now->toDateString(); // Sadece tarihi al (Y-m-d)
         $kernelLog = [];
 
         $this->info('Workmanager log update job başlatıldı: ' . $now->toDateTimeString());
 
-        // workmanager_ai değeri 1 olan kullanıcıları çek.
         $users = User::where('workmanager_ai', 1)->get();
         if ($users->isEmpty()) {
             $this->info('İşlenecek kullanıcı bulunamadı.');
             return;
         }
 
-        // Her kullanıcı için işlemleri gerçekleştir.
         foreach ($users as $user) {
-            $this->processUser($user, $now, $today, $kernelLog);
+            try { // TÜM KULLANICI İŞLEMLERİNİ TRY-CATCH İÇİNE ALIYORUZ
+                $this->processUser($user, $now, $today, $kernelLog);
+            } catch (\Exception $e) {
+                $logMessage = "[processUser] => User ID: {$user->id}, Hata: " . $e->getMessage();
+                \Log::error($logMessage);
+                $kernelLog[$user->id]['error'] = $logMessage;
+            }
         }
 
-        // Kernel logları JSON formatında dosyaya kaydetme
-        $jsonData = json_encode($kernelLog, JSON_PRETTY_PRINT);
+
+        $jsonData = json_encode($kernelLog, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
         $filename = 'workmanager_kernel_' . $today . '.json';
         Storage::disk('local')->put($filename, $jsonData);
 
-        // Opsiyonel D modu: Resume kontrol özet bildirimi gönderilir.
         if (strtoupper($this->option('mode')) === 'D') {
             $this->sendResumeSummaryNotification($kernelLog);
         }
 
         // Admin bildirimlerinin gönderilmesi (Hem Resume hem de Stop için)
         $this->sendAdminNotifications($now, $kernelLog);
+
 
         $this->info('Workmanager logs update job tamamlandı.');
     }
@@ -107,64 +115,61 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
             return;
         }
 
-        // 3) Mevcut workmanager_logs kaydı: Bugüne ait log kaydı çekilir.
+        // 3) Mevcut workmanager_logs kaydı
         $wmLog = WorkmanagerLog::where('user_id', $user->id)
-            ->whereDate('date', $today)
+            ->whereDate('date', $today) // ->whereDate('created_at', $today) yerine.
             ->first();
         if (!$wmLog) {
             $kernelLog[$user->id]['wmLog'] = 'Log kaydı bulunamadı, atlandı';
             return;
         }
 
-        // 4) Geo Log Kontrolü: Bugüne ait en son geo log alınır.
+        // 4) Geo Log Kontrolü
         $lastGeoLog = DB::table('geo_logs')
             ->where('user_id', $user->id)
-            ->whereDate('created_at', Carbon::today(self::TIMEZONE))
+            ->whereDate('created_at', $today) // ->whereDate ile sadece bugünkü kayıtlar
             ->orderBy('created_at', 'desc')
             ->first();
 
+
         if (!$lastGeoLog) {
-            // GEO_LOGS kaydı yoksa, resume mekanizması devreye girsin.
             $kernelLog[$user->id]['geoLog'] = 'Bugüne ait geo log bulunamadı; Resume tetikleniyor';
             $this->checkWorkManagerResumeStatusDB($user, $wmLog, $kernelLog);
             return;
         }
 
-        // Geo log mevcutsa, konum bilgisi belirlenir.
-        $currentLocation = isset($lastGeoLog->location)
-            ? $lastGeoLog->location
-            : ($lastGeoLog->lat . ',' . $lastGeoLog->lng);
+        $currentLocation = $lastGeoLog->location ?? ($lastGeoLog->lat . ',' . $lastGeoLog->lng);
 
-        // 5) Kullanıcının aktifliği: Son geo log ile şimdiki zaman arasındaki fark hesaplanır.
-        $diffSeconds = Carbon::parse($lastGeoLog->created_at)->diffInSeconds($now);
+        // 5) Kullanıcının aktifliği
+        $diffSeconds = Carbon::parse($lastGeoLog->created_at, $this->timezone)->diffInSeconds($now);
         $isActive = ($diffSeconds <= self::ACTIVE_THRESHOLD_SECONDS);
         $kernelLog[$user->id]['active'] = $isActive ? 'active' : 'inactive';
 
-        // Eğer kullanıcı aktif değilse, resume kontrolü tetiklenir.
+
         if (!$isActive) {
             $kernelLog[$user->id]['action'] = 'User inactive; resume command triggered';
             $this->checkWorkManagerResumeStatusDB($user, $wmLog, $kernelLog);
             return;
         }
 
-        // 6) Bugünkü attendance (giriş) kaydı alınır.
+        // 6) Bugünkü attendance (giriş) kaydı
         $attendance = Attendance::where('user_id', $user->id)
             ->whereDate('check_in_time', $today)
             ->first();
 
-        // 7) Sabah İşlemleri: Erken check-in ve giriş kontrolleri.
+        // 7) Sabah İşlemleri
         $this->processMorningNotifications($user, $now, $wmLog, $attendance, $currentLocation, $kernelLog);
 
-        // 8) Akşam İşlemleri: Check-out ve stop bildirimleri.
+        // 8) Akşam İşlemleri
         $this->processEveningNotifications($user, $now, $wmLog, $attendance, $currentLocation, $kernelLog);
     }
 
     // ---------------------------------------------------------
-    // Module B: Sabah İşlemleri - Giriş Kontrolleri ve Bildirimler
+    // Module B: Sabah İşlemleri
     // ---------------------------------------------------------
     private function processMorningNotifications($user, Carbon $now, $wmLog, $attendance, $currentLocation, array &$kernelLog)
     {
-        if ($now->between(Carbon::createFromTimeString(self::EARLY_CHECKIN_START), Carbon::createFromTimeString(self::EARLY_CHECKIN_END))) {
+        if ($now->between(Carbon::createFromTimeString(self::EARLY_CHECKIN_START, $this->timezone), Carbon::createFromTimeString(self::EARLY_CHECKIN_END, $this->timezone))) {
             if (!$attendance) {
                 if ($this->isWithinProximity($currentLocation, $user->check_in_location)) {
                     $this->sendEarlyCheckInNotification($user);
@@ -177,7 +182,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
             }
         }
 
-        if (!$attendance && $now->between(Carbon::createFromTimeString(self::MORNING_CHECKIN_START), Carbon::createFromTimeString(self::MORNING_CHECKIN_END))) {
+        if (!$attendance && $now->between(Carbon::createFromTimeString(self::MORNING_CHECKIN_START, $this->timezone), Carbon::createFromTimeString(self::MORNING_CHECKIN_END, $this->timezone))) {
             if ($this->isWithinProximity($currentLocation, $user->check_in_location)) {
                 if ($now->hour == 9 && $wmLog->checkGiris09 == 0) {
                     $wmLog->checkGiris09 = 1;
@@ -189,7 +194,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
                     $wmLog->save();
                     $kernelLog[$user->id]['checkGiris11'] = 'Updated at 11:00';
                 }
-                if ($now->between(Carbon::createFromTime(12, 20, 0), Carbon::createFromTime(12, 21, 0)) && $wmLog->checkGiris12_20 == 0) {
+                if ($now->between(Carbon::createFromTime(12, 20, 0, $this->timezone), Carbon::createFromTime(12, 21, 0, $this->timezone)) && $wmLog->checkGiris12_20 == 0) {
                     $wmLog->checkGiris12_20 = 1;
                     $wmLog->save();
                     $kernelLog[$user->id]['checkGiris12_20'] = 'Updated at 12:20';
@@ -203,58 +208,68 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     }
 
     // ---------------------------------------------------------
-    // Module B: Akşam İşlemleri - Check-out ve Stop Bildirimleri
+    // Module B: Akşam İşlemleri (DÜZENLENMİŞ)
     // ---------------------------------------------------------
-    private function processEveningNotifications($user, Carbon $now, $wmLog, $attendance, $currentLocation, array &$kernelLog)
+    private function processEveningNotifications($user, Carbon $now, WorkmanagerLog $wmLog, $attendance, $currentLocation, array &$kernelLog)
     {
-        // Eğer kullanıcı vardiyadaysa akşam bildirimleri devre dışı kalsın.
+        // Vardiyada olan kullanıcılar için akşam bildirimleri atlanır.
         if ($this->isUserInShift($user)) {
             $kernelLog[$user->id]['evening'] = 'User in shift; evening notifications deferred';
             return;
         }
 
-        // Kullanıcı check-in yapmış fakat check-out yapmamışsa
+        // Kullanıcı giriş yapmış ama çıkış yapmamışsa:
         if ($attendance && !$attendance->check_out_time) {
-            // Zaman kontrolleri Europe/Istanbul zaman diliminde yapılıyor.
-            $timeNow = Carbon::now(self::TIMEZONE);
-
-            // 16:50 kontrolü: Kullanıcı konumdaysa
-            if ($timeNow->greaterThanOrEqualTo(Carbon::createFromTime(16, 50, 0, self::TIMEZONE)) && $wmLog->checkCikis1655 == 0) {
+            // 16:50 Kontrolü: Kullanıcı konumdaysa ve checkCikis1655 henüz 0 ise:
+            if ($now->gte(Carbon::createFromTime(16, 50, 0, $this->timezone)) && $wmLog->checkCikis1655 == 0) {
                 if ($this->isWithinProximity($currentLocation, $user->check_out_location)) {
                     $wmLog->checkCikis1655 = 1;
                     $wmLog->save();
-                    $kernelLog[$user->id]['checkCikis1655'] = 'Updated at 16:50';
+                    $kernelLog[$user->id]['checkCikis1655'] = 'Updated at 16:50 (konumda)';
+                    // Bildirim gönder (isteğe bağlı)
+                } else {
+                    $kernelLog[$user->id]['checkCikis1655'] = '16:50 - User NOT near check-out location';
                 }
             }
-            // 17:08 kontrolü: Kullanıcı hâlâ çıkış yapmamışsa ve konumdaysa
-            if ($timeNow->greaterThanOrEqualTo(Carbon::createFromTime(17, 8, 0, self::TIMEZONE)) && $wmLog->checkCicis1715 == 0) {
+
+            // 17:15 Kontrolü:  Kullanıcı hala çıkış yapmamış, konumda ve checkCikis1715 henüz 0 ise:
+            if ($now->gte(Carbon::createFromTime(17, 15, 0, $this->timezone)) && $wmLog->checkCikis1715 == 0) {
                 if ($this->isWithinProximity($currentLocation, $user->check_out_location)) {
-                    $wmLog->checkCicis1715 = 1;
+                    $wmLog->checkCikis1715 = 1;
                     $wmLog->save();
-                    $kernelLog[$user->id]['checkCicis1715'] = 'Updated at 17:08';
+                    $kernelLog[$user->id]['checkCikis1715'] = 'Updated at 17:15 (konumda).';
+                    // Bildirim gönder (isteğe bağlı)
+                } else {
+                    $kernelLog[$user->id]['checkCikis1655'] = '17:15 - User NOT near check-out location';
                 }
             }
-            // 17:40 kontrolü: Konum kontrolü olmaksızın
-            if ($timeNow->greaterThanOrEqualTo(Carbon::createFromTime(17, 40, 0, self::TIMEZONE)) && $wmLog->checkCicisAfter1740 == 0) {
-                $wmLog->checkCicisAfter1740 = 1;
+
+            // 17:40 Kontrolü: Kullanıcı hala çıkış yapmamışsa (konumdan bağımsız) ve checkCikisAfter1740 henüz 0 ise:
+            if ($now->gte(Carbon::createFromTime(17, 40, 0, $this->timezone)) && $wmLog->checkCikisAfter1740 == 0) {
+                $wmLog->checkCikisAfter1740 = 1;
                 $wmLog->save();
-                $kernelLog[$user->id]['checkCicisAfter1740'] = 'Updated at 17:40';
+                $kernelLog[$user->id]['checkCikisAfter1740'] = 'Updated at 17:40 (konum kontrolsüz)';
+                //Bildirim gönder (İsteğe bağlı.)
             }
-        } else if ($attendance && $attendance->check_out_time) {
-            $checkOutTime = Carbon::parse($attendance->check_out_time);
+        }
+        // Kullanıcı zaten çıkış yapmışsa ve çıkıştan 2 dakika geçmişse, stop bildirimi gönder (Eski kodunla aynı mantık)
+        else if ($attendance && $attendance->check_out_time) {
+            $checkOutTime = Carbon::parse($attendance->check_out_time, $this->timezone);
             if ($now->diffInMinutes($checkOutTime) >= 2) {
                 $kernelLog[$user->id]['stop'] = 'User stopped 2 minutes after check-out';
-                $this->checkWorkManagerStopStatus($user);
+                $this->checkWorkManagerStopStatus($user); // Bu fonksiyonda da ufak değişiklikler yaptık.
             } else {
                 $kernelLog[$user->id]['evening'] = 'User recently checked out, waiting for stop trigger';
             }
-        } else {
+        }
+        // Kullanıcı hiç giriş yapmamışsa:
+        else {
             $kernelLog[$user->id]['evening'] = 'User did not check in; evening processing skipped';
         }
     }
 
     // ---------------------------------------------------------
-    // Module A: Admin Bildirimleri (Resume & Stop) - Tekrarlı Bildirimleri Engelleyen Yapı
+    // Module A: Admin Bildirimleri (DÜZENLENMİŞ)
     // ---------------------------------------------------------
     private function sendAdminNotifications(Carbon $now, array &$kernelLog)
     {
@@ -263,22 +278,21 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
             return;
         }
 
-        // Europe/Istanbul zaman dilimi
-        $timezone = self::TIMEZONE;
-        $timeNow = Carbon::now($timezone);
-        $today = Carbon::now($timezone)->toDateString();
+        // Günün başlangıcı ve bitişi (timezone ile)
+        $today = $now->toDateString();
+        $startOfDay = Carbon::createFromFormat('Y-m-d H:i:s', $today . ' 00:00:00', $this->timezone);
+        $endOfDay = Carbon::createFromFormat('Y-m-d H:i:s', $today . ' 23:59:59', $this->timezone);
 
         // ------------------------------
-        // Admin Resume Bildirimi (örneğin saat 08:00'de)
+        // Admin Resume Bildirimi (08:00)
         // ------------------------------
-        if ($timeNow->hour == 8) {
-            $startOfDay = Carbon::createFromFormat('Y-m-d H:i:s', $today . ' 00:00:00', $timezone);
-            $endOfDay   = Carbon::createFromFormat('Y-m-d H:i:s', $today . ' 23:59:59', $timezone);
+        if ($now->format('H:i') == '08:00') {  // Sadece 08:00'da çalışır
             $existing = DB::table('wm_notification_logs')
                 ->where('user_id', $admin->id)
                 ->where('command', 'admin_resume')
                 ->whereBetween('created_at', [$startOfDay, $endOfDay])
                 ->first();
+
             if (!$existing) {
                 try {
                     $mesaiCount = 0;
@@ -289,17 +303,26 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
                     }
                     $message = 'WorkManager Resume: ' . $mesaiCount . ' mesai kullanıcısı aktif.';
                     FCMHelper::sendNotification($admin, $message);
-                    DB::table('wm_notification_logs')->insert([
-                        'user_id'     => $admin->id,
-                        'command'     => 'admin_resume',
-                        'status'      => 'sent',
-                        'explanation' => 'Admin Bildirimi: Aktif mesai sayısı: ' . $mesaiCount,
-                        'created_at'  => Carbon::now($timezone)->toDateTimeString(),
-                        'updated_at'  => Carbon::now($timezone)->toDateTimeString(),
-                    ]);
+
+                    // LOG KAYDI (try-catch içinde)
+                    try {
+                        DB::table('wm_notification_logs')->insert([
+                            'user_id' => $admin->id,
+                            'command' => 'admin_resume',
+                            'status' => 'sent',
+                            'explanation' => 'Admin resume bildirimi gönderildi. Aktif mesai sayısı: ' . $mesaiCount,
+                            'created_at' => $now->toDateTimeString(), // Carbon nesnesi
+                            'updated_at' => $now->toDateTimeString(), // Carbon nesnesi
+                        ]);
+                    } catch (\Exception $e) {
+                        \Log::error("[sendAdminNotifications: Admin Resume Log] => Hata: " . $e->getMessage());
+                        $kernelLog['admin']['resume_log_error'] = "Admin resume log kaydı hatası: " . $e->getMessage();
+                    }
+
                     $kernelLog['admin']['resume'] = "Admin resume bildirimi gönderildi: $message";
+
                 } catch (\Exception $e) {
-                    \Log::error("[sendAdminNotifications] => Admin resume bildirimi hatası: " . $e->getMessage());
+                    \Log::error("[sendAdminNotifications: Admin Resume] => Hata: " . $e->getMessage());
                     $kernelLog['admin']['resume_error'] = "Admin resume bildirimi gönderiminde hata: " . $e->getMessage();
                 }
             } else {
@@ -308,19 +331,15 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
         }
 
         // ------------------------------
-        // Admin Stop Bildirimi: Saat 00:00'daki bildirim için, kayıt sonraki günün tarihine göre oluşturulacak.
+        // Admin Stop Bildirimi (00:00) - DÜZENLENDİ!
         // ------------------------------
-        if ($timeNow->hour == 0) {
-            // Bildirimin kayıt tarihi olarak sonraki günü kullanıyoruz.
-            $notificationDate = Carbon::tomorrow($timezone);
-            $startOfDay = Carbon::createFromFormat('Y-m-d H:i:s', $notificationDate->format('Y-m-d') . ' 00:00:00', $timezone);
-            $endOfDay   = Carbon::createFromFormat('Y-m-d H:i:s', $notificationDate->format('Y-m-d') . ' 23:59:59', $timezone);
-
+        if ($now->format('H:i') == '00:00') { // SADECE GECE YARISI (00:00) ÇALIŞIR
             $existing = DB::table('wm_notification_logs')
                 ->where('user_id', $admin->id)
                 ->where('command', 'admin_stop')
                 ->whereBetween('created_at', [$startOfDay, $endOfDay])
                 ->first();
+
             if (!$existing) {
                 try {
                     $stopCount = 0;
@@ -329,19 +348,29 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
                             $stopCount++;
                         }
                     }
+
                     $message = 'WorkManager Stop: ' . $stopCount . ' mesai kullanıcısı durdu.';
                     FCMHelper::sendNotification($admin, $message);
-                    DB::table('wm_notification_logs')->insert([
-                        'user_id'     => $admin->id,
-                        'command'     => 'admin_stop',
-                        'status'      => 'sent',
-                        'explanation' => 'Admin Bildirimi: Mesai kalan kullanıcı: ' . $stopCount . ' bildirimi gönderildi.',
-                        'created_at'  => $notificationDate->toDateTimeString(),
-                        'updated_at'  => $notificationDate->toDateTimeString(),
-                    ]);
+
+                    // LOG KAYDI (try-catch içinde)
+                    try {
+                        DB::table('wm_notification_logs')->insert([
+                            'user_id' => $admin->id,
+                            'command' => 'admin_stop',
+                            'status' => 'sent',
+                            'explanation' => 'Admin stop bildirimi gönderildi. Durdurulan mesai sayısı: ' . $stopCount,
+                            'created_at' => $now->toDateTimeString(), // Carbon nesnesi!
+                            'updated_at' => $now->toDateTimeString(), // Carbon nesnesi!
+                        ]);
+                    } catch (\Exception $e) {
+                        \Log::error("[sendAdminNotifications: Admin Stop Log] => Hata: " . $e->getMessage());
+                        $kernelLog['admin']['stop_log_error'] = "Admin stop log kaydı hatası: " . $e->getMessage();
+                    }
+
                     $kernelLog['admin']['stop'] = "Admin stop bildirimi gönderildi: $message";
+
                 } catch (\Exception $e) {
-                    \Log::error("[sendAdminNotifications] => Admin stop bildirimi hatası: " . $e->getMessage());
+                    \Log::error("[sendAdminNotifications: Admin Stop] => Hata: " . $e->getMessage());
                     $kernelLog['admin']['stop_error'] = "Admin stop bildirimi gönderiminde hata: " . $e->getMessage();
                 }
             } else {
@@ -351,23 +380,23 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     }
 
     // ---------------------------------------------------------
-    // Module B: Konum Yakınlık Kontrolü
+    // (Diğer Yardımcı Fonksiyonlar - Çoğu Aynı, Ufak Değişiklikler Var)
     // ---------------------------------------------------------
     private function isWithinProximity($currentLocation, $designatedLocation, $threshold = 0.001)
     {
+        // Haversine formülü veya daha gelişmiş bir yöntem KULLANILABİLİR (isteğe bağlı)
+        // ... (şimdilik aynı bırakıyorum)
         list($currLat, $currLng) = explode(',', $currentLocation);
         list($desLat, $desLng) = explode(',', $designatedLocation);
         $latDiff = abs(floatval($currLat) - floatval($desLat));
         $lngDiff = abs(floatval($currLng) - floatval($desLng));
         return ($latDiff < $threshold && $lngDiff < $threshold);
+
     }
 
-    // ---------------------------------------------------------
-    // Module A: Hafta Sonu/Tatil Kontrolleri ve İzin Durumu
-    // ---------------------------------------------------------
     private function isHolidayOrWeekend()
     {
-        $today = Carbon::today(self::TIMEZONE);
+        $today = Carbon::today($this->timezone); // Zaman dilimi
         if (in_array($today->dayOfWeek, [\Carbon\CarbonInterface::SATURDAY, \Carbon\CarbonInterface::SUNDAY])) {
             return true;
         }
@@ -380,22 +409,24 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
 
     private function isUserOnLeave(User $user): bool
     {
-        $today = Carbon::today(self::TIMEZONE);
+        $today = Carbon::today($this->timezone);
+
         if ($today->isWeekend()) {
             return WeekendControlController::isWeekendActiveForUser($user) ? false : true;
         }
+
         $leave = DB::table('halfday_requests')
             ->where('user_id', $user->id)
-            ->where('date', $today->toDateString())
+            ->where('date', $today)
             ->whereIn('type', ['morning', 'rapor'])
             ->where('status', 'approved')
             ->first();
-        return $leave ? true : false;
-    }
 
+        return !empty($leave);
+    }
     private function isUserInShift($user)
     {
-        $today = Carbon::today(self::TIMEZONE)->toDateString();
+        $today = Carbon::today($this->timezone)->toDateString(); // Zaman dilimi ve sadece tarih
         $shift = DB::table('shift_logs')
             ->where('user_id', $user->id)
             ->whereDate('shift_date', $today)
@@ -403,9 +434,6 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
         return $shift ? true : false;
     }
 
-    // ---------------------------------------------------------
-    // Module C: Bildirim Gönderim Fonksiyonları (Firebase)
-    // ---------------------------------------------------------
     private function sendEarlyCheckInNotification($user)
     {
         try {
@@ -444,26 +472,28 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     }
 
     // ---------------------------------------------------------
-    // Module C: DB Tabanlı Resume Kontrolü ve Bildirimi
-    // ---------------------------------------------------------
+// Module C: DB Tabanlı Resume Kontrolü ve Bildirimi (DÜZENLENMİŞ)
+// ---------------------------------------------------------
     private function checkWorkManagerResumeStatusDB($user, WorkmanagerLog $wmLog, array &$kernelLog)
     {
-        $now = Carbon::now(self::TIMEZONE);
+        $now = Carbon::now($this->timezone); // Zaman dilimi
         $attemptCount = $wmLog->resume_attempt_count ?? 0;
-        $sentTime = $wmLog->resume_sent_time ? Carbon::parse($wmLog->resume_sent_time) : null;
+        $sentTime = $wmLog->resume_sent_time ? Carbon::parse($wmLog->resume_sent_time, $this->timezone) : null; // Zaman dilimi
 
         // GEO_LOGS kontrolü: Bugüne ait en son kaydın zamanı alınır.
         $lastGeoLog = DB::table('geo_logs')
             ->where('user_id', $user->id)
-            ->whereDate('created_at', Carbon::today(self::TIMEZONE))
+            ->whereDate('created_at', Carbon::today($this->timezone)) // Zaman dilimi ve bugün
             ->orderBy('created_at', 'desc')
             ->first();
 
         $workmanagerOff = false;
-        $geoDiff = null;
+
+        // Geo log kontrol ve tolerans (workmanageroff durumu)
         if ($lastGeoLog) {
-            $geoDiff = $now->diffInMinutes(Carbon::parse($lastGeoLog->created_at));
-            if ($geoDiff >= self::NO_GEO_LOG_THRESHOLD_MINUTES) {
+            $geoDiff = $now->diffInMinutes(Carbon::parse($lastGeoLog->created_at, $this->timezone));
+            //Toleranslı kontrol.
+            if ($geoDiff >= (self::NO_GEO_LOG_THRESHOLD_MINUTES - self::WORKMANAGER_CONTROL_TOLERANCE_MINUTES)) {
                 $workmanagerOff = true;
                 $kernelLog[$user->id]['geoLog'] = "Son geo log {$geoDiff} dk önce; (≥ " . self::NO_GEO_LOG_THRESHOLD_MINUTES . " dk) workmanager kapalı kabul edildi.";
             } else {
@@ -476,22 +506,25 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
 
         if (!$workmanagerOff) {
             $kernelLog[$user->id]['resume'] = "Workmanager aktif; resume bildirimi gönderilmiyor.";
-            return;
+            return; // Fonksiyondan çık
         }
 
+        // Daha önce resume gönderilmiş mi, gönderildiyse ne zaman? (6dk kontrolü)
         if ($sentTime) {
             $diffMinutes = $now->diffInMinutes($sentTime);
             if ($diffMinutes < (self::RESUME_CACHE_SECONDS / 60)) {
                 $kernelLog[$user->id]['resume'] = "Resume bildirimi {$diffMinutes} dk önce gönderilmiş; 6 dk aralık geçmeden yeni push gönderilmiyor.";
-                return;
+                return; // Fonksiyondan çık
             }
         }
 
+        // Maksimum deneme yapılmış mı? (3 deneme / 2 saat)
         if ($attemptCount >= self::MAX_RESUME_ATTEMPTS) {
             if ($sentTime && $now->diffInHours($sentTime) < self::RESUME_WAIT_HOURS) {
                 $kernelLog[$user->id]['resume'] = "Max {$attemptCount} deneme yapıldı, ancak 2 saatlik bekleme süresi henüz dolmadı.";
-                return;
+                return;  // Fonksiyondan çık
             } else {
+                // 2 saat dolmuş, sayaçları sıfırla
                 $wmLog->resume_attempt_count = 0;
                 $wmLog->resume_sent_time = null;
                 $wmLog->save();
@@ -499,6 +532,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
             }
         }
 
+        // Bildirim gönderme (try-catch içinde)
         $kernelLog[$user->id]['resume_action'] = "Workmanager kapalı; resume bildirimi tetikleniyor. (Deneme: " . ($attemptCount + 1) . ")";
         try {
             $this->triggerWorkManagerResumeDB($user, $wmLog, $kernelLog);
@@ -508,12 +542,15 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
         }
     }
 
+
     private function triggerWorkManagerResumeDB($user, WorkmanagerLog $wmLog, array &$kernelLog)
     {
+
         \Log::info("[triggerWorkManagerResumeDB] => User ID: {$user->id} için resume bildirimi gönderiliyor.");
+
         try {
-            $now = Carbon::now(self::TIMEZONE);
-            $wmLog->resume_sent_time = $now;
+            $now = Carbon::now($this->timezone);  // Zaman dilimi!
+            $wmLog->resume_sent_time = $now; // Carbon nesnesi ve timezone
             $wmLog->resume_attempt_count = ($wmLog->resume_attempt_count ?? 0) + 1;
             $wmLog->save();
 
@@ -524,6 +561,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
                 ->where('user_id', $user->id)
                 ->pluck('fcm_token')
                 ->toArray();
+
             if (empty($tokens)) {
                 \Log::info("[triggerWorkManagerResumeDB] => User ID: {$user->id} için FCM token bulunamadı.");
                 $kernelLog[$user->id]['resume'] = "FCM token bulunamadı.";
@@ -543,17 +581,25 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
             $sendReport = $messaging->sendMulticast($msg, $tokens);
             $successCount = $sendReport->successes()->count();
             $failureCount = $sendReport->failures()->count();
+
             \Log::info("[triggerWorkManagerResumeDB] => Resume push gönderildi. Success={$successCount}, Failure={$failureCount}");
             $kernelLog[$user->id]['resume'] = "Resume push gönderildi: Success={$successCount}, Failure={$failureCount}.";
 
-            DB::table('wm_notification_logs')->insert([
-                'user_id'     => $user->id,
-                'command'     => 'resume',
-                'status'      => 'sent',
-                'explanation' => 'Resume push gönderildi: GEO_LOGS kaydı mevcut değil veya ≥ ' . self::NO_GEO_LOG_THRESHOLD_MINUTES . ' dk, deneme: ' . $wmLog->resume_attempt_count,
-                'created_at'  => $now->toDateTimeString(),
-                'updated_at'  => $now->toDateTimeString(),
-            ]);
+            // LOG KAYDI (try-catch içinde!)
+            try {
+                DB::table('wm_notification_logs')->insert([
+                    'user_id' => $user->id,
+                    'command' => 'resume',
+                    'status' => 'sent',
+                    'explanation' => 'Resume push gönderildi: GEO_LOGS kaydı mevcut değil veya ≥ ' . self::NO_GEO_LOG_THRESHOLD_MINUTES . ' dk, deneme: ' . $wmLog->resume_attempt_count,
+                    'created_at' => $now->toDateTimeString(), // Carbon Nesnesi ve zaman dilimi!
+                    'updated_at' => $now->toDateTimeString(), // Carbon Nesnesi ve zaman dilimi!
+                ]);
+            } catch (\Exception $e) {
+                \Log::error("[triggerWorkManagerResumeDB: Log Kaydı] => Hata: " . $e->getMessage());
+                $kernelLog[$user->id]['resume_log_error'] = "Resume log kaydı hatası: " . $e->getMessage();
+            }
+
         } catch (\Exception $e) {
             \Log::error("[triggerWorkManagerResumeDB] => Hata: " . $e->getMessage());
             $kernelLog[$user->id]['resume_error'] = "Resume bildirimi gönderiminde hata: " . $e->getMessage();
@@ -561,60 +607,93 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     }
 
     // ---------------------------------------------------------
-    // Module C: Stop Kontrol ve Bildirim İşlemleri
+    // Module C: Stop Kontrol ve Bildirim İşlemleri (DÜZENLENMİŞ)
     // ---------------------------------------------------------
     private function checkWorkManagerStopStatus($user)
     {
-        $expectedCheckTime = Carbon::createFromTimeString(self::STOP_CHECK_TIME, self::TIMEZONE);
-        $now = Carbon::now(self::TIMEZONE);
+        // Beklenen kontrol zamanı (timezone ile)
+        $expectedCheckTime = Carbon::createFromTimeString(self::STOP_CHECK_TIME, $this->timezone);
+        $now = Carbon::now($this->timezone);
+
+        // Şu an beklenen zamandan önceyse, kontrolü atla.
+        // ---------------------------------------------------------
+        // Module C: Stop Kontrol ve Bildirim İşlemleri (DÜZENLENMİŞ) - DEVAM
+        // ---------------------------------------------------------   
+        // Beklenen kontrol zamanı (timezone ile)
+        $expectedCheckTime = Carbon::createFromTimeString(self::STOP_CHECK_TIME, $this->timezone);
+        $now = Carbon::now($this->timezone);
+
+        // Şu an beklenen zamandan önceyse, kontrolü atla.
         if ($now->lessThan($expectedCheckTime)) {
             \Log::info("[checkWorkManagerStopStatus] => User ID: {$user->id} için kontrol zamanı henüz gelmedi.");
             return;
         }
+
+        // Son geo log'u al (bugüne ait)
         $lastGeoLog = DB::table('geo_logs')
             ->where('user_id', $user->id)
+            ->whereDate('created_at', Carbon::today($this->timezone)) // Bugüne ait
             ->orderBy('created_at', 'desc')
             ->first();
+
+        // Geo log varsa ve beklenen zamandan ÖNCE ise, stop başarılı.
         if ($lastGeoLog) {
-            $lastLogTime = Carbon::parse($lastGeoLog->created_at);
+            $lastLogTime = Carbon::parse($lastGeoLog->created_at, $this->timezone);
             if ($lastLogTime->lessThan($expectedCheckTime)) {
                 \Log::info("[checkWorkManagerStopStatus] => User ID: {$user->id} için WorkManager stop başarılı. (Son güncelleme: {$lastLogTime->toDateTimeString()})");
             } else {
+                // Geo log var ama beklenen zamandan SONRA.  Yeniden dene.
                 \Log::warning("[checkWorkManagerStopStatus] => User ID: {$user->id} için WorkManager stop başarısız, yeniden denenecek. (Son güncelleme: {$lastLogTime->toDateTimeString()})");
-                $this->triggerWorkManagerStop($user);
+                $this->triggerWorkManagerStop($user); // try-catch içinde çağır.
             }
         } else {
+            // Geo log yoksa, stop KONTROLÜ yapılamadı (log'a yaz).
             \Log::warning("[checkWorkManagerStopStatus] => User ID: {$user->id} için geo_log bulunamadı, stop kontrolü yapılamadı.");
+            // Burada da bildirim gönderilebilir (isteğe bağlı), ama emin değiliz.
         }
     }
+
 
     private function triggerWorkManagerStop($user)
     {
         \Log::info("[triggerWorkManagerStop] => User ID: {$user->id} için yeniden stop bildirimi gönderiliyor.");
-        try {
-            // Yeni günün başlangıcı ve bitişi (Europe/Istanbul)
-            $startOfDay = Carbon::today(self::TIMEZONE)->startOfDay()->toDateTimeString();
-            $endOfDay = Carbon::today(self::TIMEZONE)->endOfDay()->toDateTimeString();
+
+        try { // TÜM İŞLEMİ TRY-CATCH İÇİNE AL
+            // Yeni günün başlangıcı ve bitişi (timezone ile!)
+            $startOfDay = Carbon::today($this->timezone)->startOfDay()->toDateTimeString();
+            $endOfDay = Carbon::today($this->timezone)->endOfDay()->toDateTimeString();
+
+            // Aynı gün içinde daha önce stop bildirimi gönderilmiş mi?
             $existing = DB::table('wm_notification_logs')
                 ->where('user_id', $user->id)
                 ->where('command', 'stop')
                 ->whereBetween('created_at', [$startOfDay, $endOfDay])
                 ->first();
+
             if ($existing) {
                 \Log::info("[triggerWorkManagerStop] => User ID: {$user->id} için stop bildirimi daha önce gönderilmiş.");
-                return;
+                return; // Fonksiyondan çık
             }
 
+            // Bildirim gönder (FCMHelper kullan)
             FCMHelper::sendNotification($user, 'WorkManager Stop: Lütfen durumu kontrol ediniz.');
-            DB::table('wm_notification_logs')->insert([
-                'user_id'     => $user->id,
-                'command'     => 'stop',
-                'status'      => 'sent',
-                'explanation' => 'Stop bildirimi gönderildi: Kullanıcı check-out sonrası 2 dk bekleyip durdu.',
-                'created_at'  => Carbon::now(self::TIMEZONE)->toDateTimeString(),
-                'updated_at'  => Carbon::now(self::TIMEZONE)->toDateTimeString(),
-            ]);
-            \Log::info("[triggerWorkManagerStop] => User ID: {$user->id} için stop bildirimi gönderildi ve kayıt oluşturuldu.");
+
+            // LOG KAYDI (try-catch içinde!)
+            try {
+                DB::table('wm_notification_logs')->insert([
+                    'user_id' => $user->id,
+                    'command' => 'stop',
+                    'status' => 'sent',
+                    'explanation' => 'Stop bildirimi gönderildi: Kullanıcı check-out sonrası 2 dk bekleyip durdu.',
+                    'created_at' => Carbon::now($this->timezone)->toDateTimeString(), // Carbon ve timezone!
+                    'updated_at' => Carbon::now($this->timezone)->toDateTimeString(), // Carbon ve timezone!
+                ]);
+                \Log::info("[triggerWorkManagerStop] => User ID: {$user->id} için stop bildirimi gönderildi ve kayıt oluşturuldu.");
+            } catch (\Exception $e) {
+                \Log::error("[triggerWorkManagerStop: Log Kaydı] => Hata: " . $e->getMessage());
+            }
+
+
         } catch (\Exception $e) {
             \Log::error("[triggerWorkManagerStop] => Hata: " . $e->getMessage());
         }
@@ -625,7 +704,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     // ---------------------------------------------------------
     private function hasCustomHours($user)
     {
-        return false;
+        return false; // Şimdilik false döndürüyoruz.
     }
 
     // ---------------------------------------------------------
@@ -634,7 +713,8 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     private function sendResumeSummaryNotification(array $kernelLog)
     {
         \Log::info("[sendResumeSummaryNotification] => Resume özet bildirimi gönderiliyor.");
-        // Özet bildirimi gönderimi için gerekli işlemleri burada gerçekleştirin.
+        // Özet bildirimi gönderimi için gerekli işlemleri burada yap.
+        // (Şimdilik boş bırakıyorum)
     }
 
     // ---------------------------------------------------------
@@ -642,15 +722,15 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     // ---------------------------------------------------------
     private function isWorkManagerActive(WorkmanagerLog $wmLog)
     {
-        $now = Carbon::now(self::TIMEZONE);
+        $now = Carbon::now($this->timezone); // Zaman dilimi
         $lastGeoLog = DB::table('geo_logs')
             ->where('user_id', $wmLog->user_id)
             ->orderBy('created_at', 'desc')
             ->first();
         if ($lastGeoLog) {
-            $diffSeconds = Carbon::parse($lastGeoLog->created_at)->diffInSeconds($now);
+            $diffSeconds = Carbon::parse($lastGeoLog->created_at, $this->timezone)->diffInSeconds($now);  // Zaman dilimi
             return $diffSeconds <= self::WORKMANAGER_ACTIVE_THRESHOLD_SECONDS;
         }
         return false;
     }
-}
+} // class UpdateWorkmanagerLogsCommand'ın kapanış parantezi
