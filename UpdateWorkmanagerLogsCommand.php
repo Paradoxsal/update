@@ -32,6 +32,9 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     const RESUME_WAIT_HOURS = 2;
     const WORKMANAGER_CONTROL_TOLERANCE_MINUTES = 3;
 
+    const TIMEZONE = 'Europe/Istanbul';
+
+
     // ---------------------------------------------------------
     // Komut Ayarları
     // ---------------------------------------------------------
@@ -481,7 +484,7 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
         // 1. Geo Log Kontrolü: Bugüne ait en son geo log kaydını çekiyoruz.
         $lastGeoLog = DB::table('geo_logs')
             ->where('user_id', $user->id)
-            ->whereDate('created_at', Carbon::today(self::TIMEZONE))
+            ->whereBetween('created_at', [Carbon::now('UTC')->startOfDay(), Carbon::now('UTC')->endOfDay()])
             ->orderBy('created_at', 'desc')
             ->first();
 
@@ -542,68 +545,80 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
     // ---------------------------------------------------------
     private function checkWorkManagerResumeStatusDB($user, WorkmanagerLog $wmLog, array &$kernelLog)
     {
-        $now = Carbon::now(self::TIMEZONE);
-        $attemptCount = $wmLog->resume_attempt_count ?? 0;
-        $sentTime = $wmLog->resume_sent_time ? Carbon::parse($wmLog->resume_sent_time) : null;
-
-        // 1) Bugüne ait son geo log kaydı çekilir.
-        $lastGeoLog = DB::table('geo_logs')
-            ->where('user_id', $user->id)
-            ->whereDate('created_at', Carbon::today(self::TIMEZONE))
-            ->orderBy('created_at', 'desc')
-            ->first();
-
-        // 2) Geo log süresi hesaplanır.
-        $geoDiff = null;
-        if ($lastGeoLog) {
-            $geoDiff = $now->diffInMinutes(Carbon::parse($lastGeoLog->created_at));
-            $kernelLog[$user->id]['geoLog'] = "Son geo log {$geoDiff} dk önce.";
-        } else {
-            $kernelLog[$user->id]['geoLog'] = "Bugüne ait geo log kaydı yok.";
-        }
-
-        // 3) Workmanager kapalı mı? (10 dk üstü inaktif say)
-        $workmanagerOff = false;
-        if (!$lastGeoLog || ($geoDiff !== null && $geoDiff >= self::NO_GEO_LOG_THRESHOLD_MINUTES)) {
-            $workmanagerOff = true;
-            $kernelLog[$user->id]['status'] = "Workmanager kapalı kabul edildi (≥ " . self::NO_GEO_LOG_THRESHOLD_MINUTES . " dk).";
-        } else {
-            $kernelLog[$user->id]['resume'] = "Workmanager aktif (Son geo log: {$geoDiff} dk), resume gönderilmiyor.";
-            return; // Bu return ile çıkıyoruz; çünkü workmanager aktif demek.
-        }
-
-        // 4) Son resume gönderiminden bu yana 6 dakika geçmedi mi?
-        //    Her job tetiklenişinde tekrar bildirim gönderilmemesi için.
-        if ($sentTime) {
-            $diffSinceLastResume = $now->diffInMinutes($sentTime);
-            if ($diffSinceLastResume < 6) {
-                $kernelLog[$user->id]['resume'] = "Resume bildirimi {$diffSinceLastResume} dk önce gönderilmiş, 6 dk dolmadan tekrar gönderilmiyor.";
-                return;
-            }
-        }
-
-        // 5) Maksimum deneme sayısı ve 2 saat bekleme kuralı
-        if ($attemptCount >= self::MAX_RESUME_ATTEMPTS) {
-            // Daha önce 3 kez denendiyse, 2 saat bekleme süresi doldu mu?
-            if ($sentTime && $now->diffInHours($sentTime) < self::RESUME_WAIT_HOURS) {
-                $kernelLog[$user->id]['resume'] = "Max {$attemptCount} deneme yapıldı, 2 saatlik bekleme süresi henüz dolmadı.";
-                return;
-            } else {
-                // 2 saat dolmuşsa, deneme sayısını sıfırla ve tekrar deneyebil.
-                $wmLog->resume_attempt_count = 0;
-                $wmLog->resume_sent_time = null;
-                $wmLog->save();
-                $kernelLog[$user->id]['resumeReset'] = "2 saat bekleme süresi doldu, deneme sayısı sıfırlandı.";
-            }
-        }
-
-        // 6) Buraya geldiysek, workmanager kapalı ve resume bildirimi gönderilebilir.
-        $kernelLog[$user->id]['resume_action'] = "Workmanager kapalı, resume bildirimi tetikleniyor. (Deneme: " . ($attemptCount + 1) . ")";
         try {
+            // 1) Şu anki zaman (hiçbir timezone kullanmıyoruz)
+            $now = Carbon::now();
+
+            // 2) Workmanager log üzerinden son resume bilgileri
+            $attemptCount = $wmLog->resume_attempt_count ?? 0;
+            $sentTime = $wmLog->resume_sent_time ? Carbon::parse($wmLog->resume_sent_time) : null;
+
+            // 3) Bugüne ait en son geo log kaydını çekiyoruz
+            $todayDate = Carbon::today()->toDateString();
+            \Log::info("User {$user->id}: Checking geo_logs for date = {$todayDate}");
+
+            $lastGeoLog = DB::table('geo_logs')
+                ->where('user_id', $user->id)
+                ->whereDate('created_at', $todayDate)
+                ->orderBy('created_at', 'desc')
+                ->first();
+
+            $geoDiff = null;
+            if ($lastGeoLog) {
+                // created_at ile şu an arasındaki dakika farkı
+                $geoDiff = Carbon::parse($lastGeoLog->created_at)->diffInMinutes($now);
+                \Log::info("User {$user->id}: lastGeoLog created_at={$lastGeoLog->created_at}, geoDiff={$geoDiff} dk, now={$now}");
+            } else {
+                \Log::info("User {$user->id}: Bugüne ait geo_log bulunamadı.");
+            }
+
+            // 4) Workmanager Kapalı mı?
+            //    - Hiç kayıt yoksa ya da son kayıt >= 10 dk önceyse
+            if (!$lastGeoLog || ($geoDiff !== null && $geoDiff >= self::NO_GEO_LOG_THRESHOLD_MINUTES)) {
+                \Log::info("User {$user->id}: Workmanager kapalı kabul edildi. (geoDiff={$geoDiff})");
+                $kernelLog[$user->id]['status'] = "Workmanager kapalı (≥ " . self::NO_GEO_LOG_THRESHOLD_MINUTES . " dk).";
+            } else {
+                \Log::info("User {$user->id}: Workmanager aktif, resume tetiklenmiyor. (geoDiff={$geoDiff})");
+                $kernelLog[$user->id]['status'] = "Workmanager aktif (geoDiff={$geoDiff}).";
+                return; // Aktif olduğu için resume gönderilmez
+            }
+
+            // 5) Resume gönderimi öncesi kontroller
+
+            // 5a) Son gönderimden 6 dk geçmemişse
+            if ($sentTime) {
+                $diffSinceLastResume = $now->diffInMinutes($sentTime);
+                if ($diffSinceLastResume < 6) {
+                    \Log::info("User {$user->id}: Resume bildirimi {$diffSinceLastResume} dk önce gönderilmiş, 6 dk dolmadan gönderilmiyor.");
+                    $kernelLog[$user->id]['resume'] = "Son resume 6 dk dolmadı, iptal.";
+                    return;
+                }
+            }
+
+            // 5b) Maksimum deneme sayısı (3) ve 2 saat bekleme
+            if ($attemptCount >= self::MAX_RESUME_ATTEMPTS) {
+                if ($sentTime && $now->diffInHours($sentTime) < self::RESUME_WAIT_HOURS) {
+                    \Log::info("User {$user->id}: Max deneme ({$attemptCount}) aşıldı, 2 saat bekleme süresi dolmadı.");
+                    $kernelLog[$user->id]['resume'] = "Max deneme, 2 saat dolmadı.";
+                    return;
+                } else {
+                    // Bekleme süresi doldu, resetliyoruz
+                    $wmLog->resume_attempt_count = 0;
+                    $wmLog->resume_sent_time = null;
+                    $wmLog->save();
+                    \Log::info("User {$user->id}: 2 saat bekleme doldu, resume deneme sayısı sıfırlandı.");
+                    $kernelLog[$user->id]['resumeReset'] = "2 saat bekleme doldu, reset.";
+                }
+            }
+
+            // 6) Buraya geldiysek resume bildirimi tetiklenebilir
+            \Log::info("User {$user->id}: Resume bildirimi gönderilecek (Deneme: " . ($attemptCount + 1) . ")");
+            $kernelLog[$user->id]['resume_action'] = "Resume tetikleniyor, attempt=" . ($attemptCount + 1);
+
             $this->triggerWorkManagerResumeDB($user, $wmLog, $kernelLog);
         } catch (\Exception $e) {
-            \Log::error("[checkWorkManagerResumeStatusDB] => Hata: " . $e->getMessage());
-            $kernelLog[$user->id]['resume_error'] = "Hata: " . $e->getMessage();
+            \Log::error("User {$user->id}: checkWorkManagerResumeStatusDB Hata => " . $e->getMessage());
+            $kernelLog[$user->id]['resume_error'] = "Hata => " . $e->getMessage();
         }
     }
 
