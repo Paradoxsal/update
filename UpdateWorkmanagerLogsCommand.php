@@ -473,7 +473,73 @@ class UpdateWorkmanagerLogsCommand extends Command implements ShouldQueue
 
     // ---------------------------------------------------------
 // Module C: DB Tabanlı Resume Kontrolü ve Bildirimi (DÜZENLENMİŞ)
-// ---------------------------------------------------------
+
+    private function checkWorkManagerStatus($user, WorkmanagerLog $wmLog, array &$kernelLog)
+    {
+        $now = Carbon::now(self::TIMEZONE);
+
+        // 1. Geo Log Kontrolü: Bugüne ait en son geo log kaydını çekiyoruz.
+        $lastGeoLog = DB::table('geo_logs')
+            ->where('user_id', $user->id)
+            ->whereDate('created_at', Carbon::today(self::TIMEZONE))
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        $geoDiff = null;
+        if ($lastGeoLog) {
+            $geoDiff = $now->diffInMinutes(Carbon::parse($lastGeoLog->created_at));
+            $kernelLog[$user->id]['geoLog'] = "Son geo log {$geoDiff} dk önce.";
+        } else {
+            $kernelLog[$user->id]['geoLog'] = "Bugüne ait geo log kaydı bulunamadı.";
+        }
+
+        // 2. Workmanager Kapalı mı? (Eğer son kayıt 10 dk veya daha eskiyse)
+        if (!$lastGeoLog || ($geoDiff !== null && $geoDiff >= self::NO_GEO_LOG_THRESHOLD_MINUTES)) {
+            $kernelLog[$user->id]['workmanagerStatus'] = "Workmanager kapalı (son geo log: {$geoDiff} dk).";
+        } else {
+            $kernelLog[$user->id]['workmanagerStatus'] = "Workmanager aktif (son geo log: {$geoDiff} dk), resume bildirimi gönderilmiyor.";
+            return; // Workmanager aktifse resume gönderimi yapılmaz.
+        }
+
+        // 3. wm_notification_logs kontrolü: Son resume bildirimi gönderim zamanını alıyoruz.
+        $lastResumeLog = DB::table('wm_notification_logs')
+            ->where('user_id', $user->id)
+            ->where('command', 'resume')
+            ->orderBy('created_at', 'desc')
+            ->first();
+        $lastResumeTime = $lastResumeLog ? Carbon::parse($lastResumeLog->created_at) : null;
+
+        // Eğer son resume bildirimi 6 dk içinde gönderilmişse, tekrar göndermiyoruz.
+        if ($lastResumeTime && $now->diffInMinutes($lastResumeTime) < 6) {
+            $kernelLog[$user->id]['resumeStatus'] = "Resume zaten {$now->diffInMinutes($lastResumeTime)} dk önce gönderilmiş; yeni bildirim bekleniyor.";
+            return;
+        }
+
+        // 4. Maksimum deneme ve 2 saat bekleme kontrolü
+        $attemptCount = $wmLog->resume_attempt_count ?? 0;
+        if ($attemptCount >= self::MAX_RESUME_ATTEMPTS) {
+            if ($lastResumeTime && $now->diffInHours($lastResumeTime) < self::RESUME_WAIT_HOURS) {
+                $kernelLog[$user->id]['resumeStatus'] = "Max {$attemptCount} deneme yapıldı, 2 saatlik bekleme süresi henüz dolmadı.";
+                return;
+            } else {
+                $wmLog->resume_attempt_count = 0;
+                $wmLog->resume_sent_time = null;
+                $wmLog->save();
+                $kernelLog[$user->id]['resumeReset'] = "2 saat bekleme süresi doldu, deneme sayısı sıfırlandı.";
+            }
+        }
+
+        // 5. Resume bildirimi gönderiliyor.
+        $kernelLog[$user->id]['resumeAction'] = "Workmanager kapalı, resume bildirimi gönderiliyor (Deneme: " . ($attemptCount + 1) . ").";
+        try {
+            $this->triggerWorkManagerResumeDB($user, $wmLog, $kernelLog);
+        } catch (\Exception $e) {
+            \Log::error("[checkWorkManagerStatus] Hata: " . $e->getMessage());
+            $kernelLog[$user->id]['resumeError'] = "Hata: " . $e->getMessage();
+        }
+    }
+
+    // ---------------------------------------------------------
     private function checkWorkManagerResumeStatusDB($user, WorkmanagerLog $wmLog, array &$kernelLog)
     {
         $now = Carbon::now(self::TIMEZONE);
